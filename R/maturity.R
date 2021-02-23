@@ -12,6 +12,7 @@
 #' @param usability_codes An optional vector of usability codes.
 #'   All usability codes not in this vector will be omitted.
 #'   Set to `NULL` to include all samples.
+#' @param link The link function for the binomial GLM (by default, \code{"logit"}).
 #' @rdname plot_mat_ogive
 #' @export
 #' @examples
@@ -34,7 +35,10 @@ fit_mat_ogive <- function(dat,
                           sample_id_re = FALSE,
                           months = seq(1, 12),
                           ageing_method_codes = NULL,
-                          usability_codes = c(0, 1, 2, 6)) {
+                          usability_codes = c(0, 1, 2, 6),
+                          link = c("logit", "probit", "cloglog", "cauchit", "log")) {
+  link <- match.arg(link)
+
   dat <- mutate(dat, month = lubridate::month(trip_start_date))
 
   dat <- dat %>% filter(maturity_convention_code != 9)
@@ -101,12 +105,12 @@ fit_mat_ogive <- function(dat,
 
   if (sample_id_re) {
     m <- glmmTMB::glmmTMB(mature ~ age_or_length * female + (1 | sample_id),
-      data = .d, family = binomial
+      data = .d, family = binomial(link)
     )
     b <- glmmTMB::fixef(m)[[1L]]
   } else {
     m <- stats::glm(mature ~ age_or_length * female,
-      data = .d, family = binomial
+      data = .d, family = binomial(link)
     )
     b <- stats::coef(m)
   }
@@ -127,12 +131,19 @@ fit_mat_ogive <- function(dat,
   if (sample_id_re) {
     nd$glmm_re <- predict(m, newdata = nd, se.fit = FALSE)
   }
-  nd$glmm_fe <- plogis(b[[1L]] + b[[3L]] * nd$female +
-    b[[2L]] * nd$age_or_length + b[[4L]] * nd$age_or_length * nd$female)
+  nd$glmm_fe <- m$family$linkinv(b[[1L]] + b[[3L]] * nd$female +
+                                   b[[2L]] * nd$age_or_length + b[[4L]] * nd$age_or_length * nd$female)
 
-  mat_perc <- extract_maturity_perc(stats::coef(m))
-  se_l50 <- tryCatch({delta_method(~ -(log((1/0.5) - 1) + x1 + x3) / (x2 + x4),
-    mean = stats::coef(m), cov = stats::vcov(m))}, error = function(e) NA)
+  mat_perc <- extract_maturity_perc(m)
+
+  if(link == "logit") {
+    se_l50 <- tryCatch({delta_method(~ -(log((1/0.5) - 1) + x1 + x3) / (x2 + x4),
+                                     mean = stats::coef(m), cov = stats::vcov(m))}, error = function(e) NA)
+  } else if(requireNamespace("numDeriv", quietly = TRUE)) {
+    se_l50 <- mat_par_delta_method(m) %>% sqrt() %>% as.numeric()
+  } else {
+    se_l50 <- paste("Download the numDeriv package to get the SE of the", type, "of 50% maturity.")
+  }
 
   list(
     data = .d, pred_data = nd, model = m, sample_id_re = sample_id_re,
@@ -202,19 +213,13 @@ plot_mat_ogive <- function(object,
   #   nd_fe <- filter(nd_fe, !female %in% c(0L, 1L)) # i.e. nothing
   # }
 
-  m_perc <- data.frame(p0.5 = logit_perc(a = b[[1]], b = b[[2]], perc = 0.5))
-  m_perc$p0.95 <- logit_perc(a = b[[1]], b = b[[2]], perc = 0.95)
-  m_perc$p0.05 <- logit_perc(a = b[[1]], b = b[[2]], perc = 0.05)
+  m_perc <- data.frame(p0.5 = object$mat_perc$m.p0.5)
+  m_perc$p0.95 <- object$mat_perc$m.p0.95
+  m_perc$p0.05 <- object$mat_perc$m.p0.05
 
-  f_perc <- data.frame(
-    p0.5 = logit_perc(a = b[[1]] + b[[3]], b = b[[2]] + b[[4]], perc = 0.5)
-  )
-  f_perc$p0.95 <- logit_perc(
-    a = b[[1]] + b[[3]], b = b[[2]] + b[[4]], perc = 0.95
-  )
-  f_perc$p0.05 <- logit_perc(
-    a = b[[1]] + b[[3]], b = b[[2]] + b[[4]], perc = 0.05
-  )
+  f_perc <- data.frame(p0.5 = object$mat_perc$f.p0.5)
+  f_perc$p0.95 <- object$mat_perc$f.p0.95
+  f_perc$p0.05 <- object$mat_perc$f.p0.05
 
   labs_f <- tibble(
     p = c("05", "50", "95"),
@@ -326,17 +331,30 @@ plot_mat_ogive <- function(object,
   g
 }
 
-extract_maturity_perc <- function(object) {
-  m.p0.5 <- logit_perc(a = object[[1]], b = object[[2]], perc = 0.5)
-  m.p0.95 <- logit_perc(a = object[[1]], b = object[[2]], perc = 0.95)
-  m.p0.05 <- logit_perc(a = object[[1]], b = object[[2]], perc = 0.05)
+get_mat_par <- function(x, a = c(1, 3), b = c(2, 4), perc = 0.5, model) {
+  aa <- sum(x[a])
+  bb <- sum(x[b])
+  uniroot_fn <- function(xx) model$family$linkinv(aa + bb * xx) - perc
+  uniroot(uniroot_fn, interval = c(-100, 100))$root
+}
 
-  f.p0.5 <- logit_perc(a = object[[1]] + object[[3]],
-    b = object[[2]] + object[[4]], perc = 0.5)
-  f.p0.95 <- logit_perc(a = object[[1]] + object[[3]],
-    b = object[[2]] + object[[4]], perc = 0.95)
-  f.p0.05 <- logit_perc(a = object[[1]] + object[[3]],
-    b = object[[2]] + object[[4]], perc = 0.05)
+mat_par_delta_method <- function(model, perc = 0.5) {
+  stopifnot(requireNamespace("numDeriv", quietly = FALSE))
+  gradient <- numDeriv::grad(get_mat_par, x = stats::coef(model), perc = perc, model = model)
+  gradient %*% stats::vcov(model) %*% gradient
+}
+
+extract_maturity_perc <- function(model) {
+  object <- stats::coef(model)
+
+  m.p0.5 <- get_mat_par(object, a = 1, b = 2, perc = 0.5, model = model)
+  m.p0.95 <- get_mat_par(object, a = 1, b = 2, perc = 0.95, model = model)
+  m.p0.05 <- get_mat_par(object, a = 1, b = 2, perc = 0.05, model = model)
+
+  f.p0.5 <- get_mat_par(object, perc = 0.5, model = model)
+  f.p0.95 <- get_mat_par(object, perc = 0.95, model = model)
+  f.p0.05 <- get_mat_par(object, perc = 0.05, model = model)
+
   list(m.p0.5 = m.p0.5, m.p0.95 = m.p0.95, m.p0.05 = m.p0.05, f.p0.5 = f.p0.5,
     f.p0.95 = f.p0.95, f.p0.05 = f.p0.05)
 }
